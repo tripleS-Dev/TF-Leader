@@ -462,7 +462,7 @@ def main() -> None:
     )
     uvicorn.run(
         create_app(settings),
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=settings.port,
         log_config=None,
         access_log=False,
