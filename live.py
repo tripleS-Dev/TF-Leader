@@ -155,7 +155,7 @@ def create_app(
 
     app = FastAPI(
         title="TF-Leader Live API",
-        version="0.3.0",
+        version="0.4.0",
         description="THE FINALS 리더보드 수집·검색·이력·그래프 localhost API",
         lifespan=lifespan,
     )
@@ -251,20 +251,28 @@ def create_app(
             "data": [_api_player(record) for record in records],
         }
 
-    @app.get("/api/users/history", summary="유저 점수·순위 이력")
+    @app.get("/api/users/history", summary="유저 점수·순위 세션 이력")
     async def user_history(
         q: Annotated[str, Query(min_length=1, max_length=100)],
         season: Annotated[str, Query(pattern=r"^s\d+$")] = settings.season,
+        session: Annotated[int, Query(ge=1)] = 1,
     ) -> dict[str, Any]:
         metadata = await asyncio.to_thread(leaderboard.latest_snapshot, season)
         if metadata is None:
             raise HTTPException(503, "리더보드 데이터가 아직 준비되지 않았습니다.")
-        history = await asyncio.to_thread(leaderboard.user_history, q, season=season)
+        result = await asyncio.to_thread(
+            leaderboard.user_history_session,
+            q,
+            season=season,
+            session=session,
+        )
         return {
             "query": q,
             "season": season,
-            "count": len(history),
-            "data": [_history_point(point) for point in history],
+            "session": result.session,
+            "totalSessions": result.total_sessions,
+            "count": len(result.points),
+            "data": [_history_point(point) for point in result.points],
         }
 
     async def graph_response(q: str, season: str, kind: ChartKind) -> Response:

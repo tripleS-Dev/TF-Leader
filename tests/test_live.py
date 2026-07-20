@@ -124,7 +124,27 @@ def test_live_api_is_clubweb_compatible_and_serves_extended_routes(tmp_path) -> 
 
         history = client.get("/api/users/history", params={"q": "Player#1234"})
         assert history.status_code == 200
-        assert [point["rank"] for point in history.json()["data"]] == [1, 1]
+        history_payload = history.json()
+        assert history_payload["session"] == 1
+        assert history_payload["totalSessions"] == 1
+        assert history_payload["count"] == 2
+        assert [point["rank"] for point in history_payload["data"]] == [1, 1]
+
+        previous = client.get(
+            "/api/users/history",
+            params={"q": "Player#1234", "session": 2},
+        )
+        assert previous.status_code == 200
+        assert previous.json()["totalSessions"] == 1
+        assert previous.json()["data"] == []
+        assert (
+            client.get(
+                "/api/users/history",
+                params={"q": "Player#1234", "session": 0},
+            ).status_code
+            == 422
+        )
+
 
         score_graph = client.get("/api/graphs/score.png", params={"q": "Player#1234"})
         assert score_graph.status_code == 200

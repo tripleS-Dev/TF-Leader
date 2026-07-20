@@ -4,7 +4,13 @@ from pathlib import Path
 
 from .charts import plot_history
 from .client import LeaderboardClient
-from .models import PlayerHistoryPoint, PlayerRecord, SnapshotMetadata, SyncResult
+from .models import (
+    PlayerHistoryPoint,
+    PlayerHistorySession,
+    PlayerRecord,
+    SnapshotMetadata,
+    SyncResult,
+)
 from .repository import LeaderboardStore
 
 
@@ -73,6 +79,15 @@ class TFLeaderboard:
         season: str = "s11",
     ) -> list[PlayerHistoryPoint]:
         return self.store.history(query, season=season)
+
+    def user_history_session(
+        self,
+        query: str,
+        *,
+        season: str = "s11",
+        session: int = 1,
+    ) -> PlayerHistorySession:
+        return self.store.history_session(query, season=season, session=session)
 
     def score_graph(
         self,

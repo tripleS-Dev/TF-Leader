@@ -14,12 +14,15 @@ from .models import (
     LeaderboardSnapshot,
     PlayerEntry,
     PlayerHistoryPoint,
+    PlayerHistorySession,
     PlayerRecord,
     SnapshotMetadata,
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+HISTORY_CHECKPOINT_INTERVAL = 12
+SESSION_INACTIVITY_FETCHES = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +35,13 @@ class _PlayerState:
     xbox_name: str = ""
     club_tag: str = ""
     club_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _HistorySessionRange:
+    player_key: str
+    start_snapshot_id: int
+    end_snapshot_id: int
 
 
 class DataIntegrityError(RuntimeError):
@@ -77,7 +87,7 @@ class LeaderboardStore:
                 WHERE type = 'table' AND name = 'snapshots'
                 """
             ).fetchone()
-            if version >= SCHEMA_VERSION or has_snapshots is None:
+            if version >= 3 or has_snapshots is None:
                 return
             snapshot_count = int(
                 source.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
@@ -242,6 +252,31 @@ class LeaderboardStore:
                     verified_at_ms INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS history_checkpoints (
+                    snapshot_id INTEGER PRIMARY KEY REFERENCES snapshots(id) ON DELETE CASCADE,
+                    season TEXT NOT NULL,
+                    entry_count INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS history_checkpoint_entries (
+                    snapshot_id INTEGER NOT NULL
+                        REFERENCES history_checkpoints(snapshot_id) ON DELETE CASCADE,
+                    player_key TEXT NOT NULL,
+                    rank INTEGER NOT NULL,
+                    rank_change_24h INTEGER NOT NULL,
+                    display_name TEXT NOT NULL,
+                    league INTEGER NOT NULL,
+                    score INTEGER NOT NULL,
+                    steam_name TEXT NOT NULL DEFAULT '',
+                    psn_name TEXT NOT NULL DEFAULT '',
+                    xbox_name TEXT NOT NULL DEFAULT '',
+                    club_tag TEXT NOT NULL DEFAULT '',
+                    club_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (snapshot_id, player_key),
+                    UNIQUE (snapshot_id, rank)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_snapshots_latest
                     ON snapshots (season, source_updated_at_ms DESC);
                 CREATE INDEX IF NOT EXISTS idx_entries_display_name
@@ -289,6 +324,8 @@ class LeaderboardStore:
                     ON rank_change_events (season, player_key, snapshot_id);
                 CREATE INDEX IF NOT EXISTS idx_order_events_snapshot
                     ON order_events (season, snapshot_id, target_rank);
+                CREATE INDEX IF NOT EXISTS idx_history_checkpoints_season
+                    ON history_checkpoints (season, snapshot_id);
                 """
             )
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -296,6 +333,8 @@ class LeaderboardStore:
                 self._migrate_legacy_snapshots(connection)
             if version < 3:
                 self._migrate_to_reconstruction(connection)
+            if version < 4:
+                self._migrate_to_history_checkpoints(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _migrate_legacy_snapshots(self, connection: sqlite3.Connection) -> None:
@@ -454,6 +493,93 @@ class LeaderboardStore:
         connection.execute("DELETE FROM snapshot_integrity")
         self._needs_compaction = True
 
+    def _migrate_to_history_checkpoints(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        """Build periodic verified states so history only replays a bounded prefix."""
+        connection.execute("DELETE FROM history_checkpoint_entries")
+        connection.execute("DELETE FROM history_checkpoints")
+        snapshots = connection.execute(
+            """
+            SELECT s.id, s.season, s.entry_count, r.content_hash
+            FROM snapshots s
+            LEFT JOIN snapshot_reconstruction r ON r.snapshot_id = s.id
+            ORDER BY s.season ASC, s.id ASC
+            """
+        ).fetchall()
+        if not snapshots:
+            return
+
+        current_by_season: dict[str, dict[str, PlayerEntry]] = {}
+        snapshot_count_by_season: dict[str, int] = {}
+        for snapshot in snapshots:
+            snapshot_id = int(snapshot["id"])
+            season = str(snapshot["season"])
+            previous = current_by_season.get(season, {})
+            state_rows = connection.execute(
+                """
+                SELECT player_key, is_present, display_name, league, score,
+                       steam_name, psn_name, xbox_name, club_tag, club_id
+                FROM player_state_events
+                WHERE snapshot_id = ?
+                """,
+                (snapshot_id,),
+            ).fetchall()
+            rank_rows = connection.execute(
+                """
+                SELECT player_key, rank_change_24h
+                FROM rank_change_events
+                WHERE snapshot_id = ?
+                """,
+                (snapshot_id,),
+            ).fetchall()
+            order_rows = connection.execute(
+                """
+                SELECT player_key, target_rank
+                FROM order_events
+                WHERE snapshot_id = ?
+                """,
+                (snapshot_id,),
+            ).fetchall()
+
+            upserts: dict[str, PlayerEntry] = {}
+            removed: list[str] = []
+            for row in state_rows:
+                key = str(row["player_key"])
+                if int(row["is_present"]):
+                    upserts[key] = _state_row_to_player(row)
+                else:
+                    removed.append(key)
+            current = _reconstruct_snapshot(
+                previous,
+                state_upserts=upserts,
+                removed=removed,
+                rank_change_updates={
+                    str(row["player_key"]): int(row["rank_change_24h"])
+                    for row in rank_rows
+                },
+                order_updates={
+                    str(row["player_key"]): int(row["target_rank"])
+                    for row in order_rows
+                },
+                expected_count=int(snapshot["entry_count"]),
+            )
+            content_hash = _state_hash(current.values())
+            stored_content_hash = snapshot["content_hash"]
+            if stored_content_hash is None or content_hash != str(stored_content_hash):
+                raise DataIntegrityError(
+                    f"checkpoint migration snapshot {snapshot_id} "
+                    "복원 해시가 일치하지 않습니다."
+                )
+
+            ordinal = snapshot_count_by_season.get(season, 0) + 1
+            snapshot_count_by_season[season] = ordinal
+            if (ordinal - 1) % HISTORY_CHECKPOINT_INTERVAL == 0:
+                self._insert_history_checkpoint(
+                    connection, snapshot_id, season, current
+                )
+            current_by_season[season] = current
+
     def _encode_reconstruction_snapshot(
         self,
         connection: sqlite3.Connection,
@@ -592,6 +718,51 @@ class LeaderboardStore:
                 rows,
             )
 
+    def _insert_history_checkpoint(
+        self,
+        connection: sqlite3.Connection,
+        snapshot_id: int,
+        season: str,
+        state: dict[str, PlayerEntry],
+    ) -> None:
+        content_hash = _state_hash(state.values())
+        connection.execute(
+            """
+            INSERT INTO history_checkpoints (
+                snapshot_id, season, entry_count, content_hash
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (snapshot_id, season, len(state), content_hash),
+        )
+        connection.executemany(
+            """
+            INSERT INTO history_checkpoint_entries (
+                snapshot_id, player_key, rank, rank_change_24h,
+                display_name, league, score, steam_name, psn_name,
+                xbox_name, club_tag, club_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (snapshot_id, key, *_player_values(entry))
+                for key, entry in state.items()
+            ),
+        )
+        saved_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM history_checkpoint_entries
+                WHERE snapshot_id = ?
+                """,
+                (snapshot_id,),
+            ).fetchone()[0]
+        )
+        if saved_count != len(state):
+            raise DataIntegrityError(
+                f"checkpoint {snapshot_id} 행 수 불일치: "
+                f"expected={len(state)}, actual={saved_count}"
+            )
+
     def save_snapshot(
         self,
         snapshot: LeaderboardSnapshot,
@@ -674,6 +845,17 @@ class LeaderboardStore:
                 previous=previous,
                 incoming=incoming,
             )
+
+            season_snapshot_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM snapshots WHERE season = ?",
+                    (snapshot.season,),
+                ).fetchone()[0]
+            )
+            if (season_snapshot_count - 1) % HISTORY_CHECKPOINT_INTERVAL == 0:
+                self._insert_history_checkpoint(
+                    connection, snapshot_id, snapshot.season, incoming
+                )
 
             removed_keys = previous.keys() - incoming.keys()
             if removed_keys:
@@ -978,6 +1160,275 @@ class LeaderboardStore:
             ).fetchall()
         return [_row_to_record(row) for row in rows]
 
+    def _find_history_target_keys(
+        self,
+        connection: sqlite3.Connection,
+        query: str,
+        season: str,
+    ) -> set[str]:
+        rows = connection.execute(
+            """
+            SELECT player_key
+            FROM player_state_events
+            WHERE season = ? AND display_name = ? COLLATE NOCASE
+            UNION
+            SELECT player_key
+            FROM player_state_events
+            WHERE season = ? AND steam_name = ? COLLATE NOCASE
+            UNION
+            SELECT player_key
+            FROM player_state_events
+            WHERE season = ? AND psn_name = ? COLLATE NOCASE
+            UNION
+            SELECT player_key
+            FROM player_state_events
+            WHERE season = ? AND xbox_name = ? COLLATE NOCASE
+            """,
+            (
+                season,
+                query,
+                season,
+                query,
+                season,
+                query,
+                season,
+                query,
+            ),
+        ).fetchall()
+        return {str(row["player_key"]) for row in rows}
+
+    def history_session(
+        self,
+        query: str,
+        *,
+        season: str = "s11",
+        session: int = 1,
+    ) -> PlayerHistorySession:
+        if session < 1:
+            raise ValueError("session은 1 이상이어야 합니다.")
+        query = query.strip()
+        if not query:
+            return PlayerHistorySession(
+                session=session, total_sessions=0, points=()
+            )
+
+        with self._connect() as connection:
+            target_keys = self._find_history_target_keys(
+                connection, query, season
+            )
+            if not target_keys:
+                return PlayerHistorySession(
+                    session=session, total_sessions=0, points=()
+                )
+
+            snapshot_rows = connection.execute(
+                """
+                SELECT id
+                FROM snapshots
+                WHERE season = ?
+                ORDER BY id ASC
+                """,
+                (season,),
+            ).fetchall()
+            placeholders = ",".join("?" for _ in target_keys)
+            target_event_rows = connection.execute(
+                f"""
+                SELECT snapshot_id, player_key, is_present, score
+                FROM player_state_events
+                WHERE season = ? AND player_key IN ({placeholders})
+                ORDER BY snapshot_id ASC
+                """,
+                (season, *sorted(target_keys)),
+            ).fetchall()
+            ranges = _history_session_ranges(
+                [int(row["id"]) for row in snapshot_rows],
+                target_keys,
+                target_event_rows,
+            )
+            ranges.sort(
+                key=lambda item: (
+                    item.end_snapshot_id,
+                    item.start_snapshot_id,
+                    item.player_key,
+                )
+            )
+            total_sessions = len(ranges)
+            if session > total_sessions:
+                return PlayerHistorySession(
+                    session=session,
+                    total_sessions=total_sessions,
+                    points=(),
+                )
+            selected = ranges[-session]
+            points = self._history_points_for_session(
+                connection,
+                season=season,
+                session_range=selected,
+            )
+
+        return PlayerHistorySession(
+            session=session,
+            total_sessions=total_sessions,
+            points=tuple(points),
+        )
+
+    def _history_points_for_session(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        season: str,
+        session_range: _HistorySessionRange,
+    ) -> list[PlayerHistoryPoint]:
+        checkpoint = connection.execute(
+            """
+            SELECT snapshot_id, entry_count, content_hash
+            FROM history_checkpoints
+            WHERE season = ? AND snapshot_id <= ?
+            ORDER BY snapshot_id DESC
+            LIMIT 1
+            """,
+            (season, session_range.start_snapshot_id),
+        ).fetchone()
+        if checkpoint is None:
+            checkpoint_id = 0
+            current: dict[str, PlayerEntry] = {}
+        else:
+            checkpoint_id = int(checkpoint["snapshot_id"])
+            current = self._load_history_checkpoint(connection, checkpoint)
+
+        snapshots = connection.execute(
+            """
+            SELECT id, source_updated_at_ms, entry_count
+            FROM snapshots
+            WHERE season = ? AND id >= ? AND id <= ?
+            ORDER BY id ASC
+            """,
+            (
+                season,
+                checkpoint_id if checkpoint_id else 0,
+                session_range.end_snapshot_id,
+            ),
+        ).fetchall()
+        state_rows = connection.execute(
+            """
+            SELECT snapshot_id, player_key, is_present,
+                   display_name, league, score, steam_name, psn_name,
+                   xbox_name, club_tag, club_id
+            FROM player_state_events
+            WHERE season = ? AND snapshot_id > ? AND snapshot_id <= ?
+            ORDER BY snapshot_id ASC
+            """,
+            (season, checkpoint_id, session_range.end_snapshot_id),
+        ).fetchall()
+        rank_rows = connection.execute(
+            """
+            SELECT snapshot_id, player_key, rank_change_24h
+            FROM rank_change_events
+            WHERE season = ? AND snapshot_id > ? AND snapshot_id <= ?
+            ORDER BY snapshot_id ASC
+            """,
+            (season, checkpoint_id, session_range.end_snapshot_id),
+        ).fetchall()
+        order_rows = connection.execute(
+            """
+            SELECT snapshot_id, player_key, target_rank
+            FROM order_events
+            WHERE season = ? AND snapshot_id > ? AND snapshot_id <= ?
+            ORDER BY snapshot_id ASC, target_rank ASC
+            """,
+            (season, checkpoint_id, session_range.end_snapshot_id),
+        ).fetchall()
+
+        state_by_snapshot: dict[int, list[sqlite3.Row]] = {}
+        rank_by_snapshot: dict[int, list[sqlite3.Row]] = {}
+        order_by_snapshot: dict[int, list[sqlite3.Row]] = {}
+        for row in state_rows:
+            state_by_snapshot.setdefault(int(row["snapshot_id"]), []).append(row)
+        for row in rank_rows:
+            rank_by_snapshot.setdefault(int(row["snapshot_id"]), []).append(row)
+        for row in order_rows:
+            order_by_snapshot.setdefault(int(row["snapshot_id"]), []).append(row)
+
+        points: list[PlayerHistoryPoint] = []
+        for snapshot in snapshots:
+            snapshot_id = int(snapshot["id"])
+            if snapshot_id != checkpoint_id:
+                upserts: dict[str, PlayerEntry] = {}
+                removed: list[str] = []
+                for row in state_by_snapshot.get(snapshot_id, []):
+                    key = str(row["player_key"])
+                    if int(row["is_present"]):
+                        upserts[key] = _state_row_to_player(row)
+                    else:
+                        removed.append(key)
+                current = _reconstruct_snapshot(
+                    current,
+                    state_upserts=upserts,
+                    removed=removed,
+                    rank_change_updates={
+                        str(row["player_key"]): int(row["rank_change_24h"])
+                        for row in rank_by_snapshot.get(snapshot_id, [])
+                    },
+                    order_updates={
+                        str(row["player_key"]): int(row["target_rank"])
+                        for row in order_by_snapshot.get(snapshot_id, [])
+                    },
+                    expected_count=int(snapshot["entry_count"]),
+                )
+
+            if snapshot_id < session_range.start_snapshot_id:
+                continue
+            player = current.get(session_range.player_key)
+            if player is None:
+                continue
+            points.append(
+                PlayerHistoryPoint(
+                    snapshot_id=snapshot_id,
+                    season=season,
+                    source_updated_at=_from_epoch_ms(
+                        snapshot["source_updated_at_ms"]
+                    ),
+                    rank=player.rank,
+                    rank_change_24h=player.rank_change_24h,
+                    score=player.score,
+                    league=player.league,
+                    display_name=player.display_name,
+                )
+            )
+        return points
+
+    def _load_history_checkpoint(
+        self,
+        connection: sqlite3.Connection,
+        checkpoint: sqlite3.Row,
+    ) -> dict[str, PlayerEntry]:
+        snapshot_id = int(checkpoint["snapshot_id"])
+        rows = connection.execute(
+            """
+            SELECT player_key, rank, rank_change_24h, display_name, league,
+                   score, steam_name, psn_name, xbox_name, club_tag, club_id
+            FROM history_checkpoint_entries
+            WHERE snapshot_id = ?
+            ORDER BY rank ASC
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        expected_count = int(checkpoint["entry_count"])
+        if len(rows) != expected_count:
+            raise DataIntegrityError(
+                f"checkpoint {snapshot_id} 행 수 불일치: "
+                f"expected={expected_count}, actual={len(rows)}"
+            )
+        state = {
+            str(row["player_key"]): _row_to_player(row)
+            for row in rows
+        }
+        if _state_hash(state.values()) != str(checkpoint["content_hash"]):
+            raise DataIntegrityError(
+                f"checkpoint {snapshot_id} SHA-256 검증에 실패했습니다."
+            )
+        return state
+
     def history(
         self,
         query: str,
@@ -1110,6 +1561,105 @@ class LeaderboardStore:
                 (season,),
             ).fetchone()
         return int(row["count"])
+
+
+def _history_session_ranges(
+    snapshot_ids: Sequence[int],
+    target_keys: set[str],
+    event_rows: Sequence[sqlite3.Row],
+) -> list[_HistorySessionRange]:
+    events = {
+        (int(row["snapshot_id"]), str(row["player_key"])): row
+        for row in event_rows
+    }
+    sessions: list[_HistorySessionRange] = []
+
+    for player_key in sorted(target_keys):
+        present = False
+        ever_seen = False
+        awaiting_score_change = False
+        current_score: int | None = None
+        closed_score: int | None = None
+        active_start: int | None = None
+        last_present: int | None = None
+        unchanged_fetches = 0
+
+        for snapshot_id in snapshot_ids:
+            event = events.get((snapshot_id, player_key))
+            reappeared = False
+            score_changed = False
+            if event is not None:
+                if not int(event["is_present"]):
+                    if active_start is not None and last_present is not None:
+                        sessions.append(
+                            _HistorySessionRange(
+                                player_key=player_key,
+                                start_snapshot_id=active_start,
+                                end_snapshot_id=last_present,
+                            )
+                        )
+                    present = False
+                    active_start = None
+                    last_present = None
+                    unchanged_fetches = 0
+                    awaiting_score_change = True
+                    closed_score = current_score
+                    current_score = None
+                    continue
+
+                new_score = int(event["score"])
+                reappeared = ever_seen and not present
+                score_changed = present and new_score != current_score
+                present = True
+                ever_seen = True
+                current_score = new_score
+            elif not present:
+                continue
+
+            if active_start is None:
+                should_start = (
+                    not awaiting_score_change
+                    or reappeared
+                    or (
+                        closed_score is not None
+                        and current_score != closed_score
+                    )
+                )
+                if not should_start:
+                    continue
+                active_start = snapshot_id
+                unchanged_fetches = 0
+                awaiting_score_change = False
+            elif score_changed:
+                unchanged_fetches = 0
+            else:
+                unchanged_fetches += 1
+
+            last_present = snapshot_id
+            if unchanged_fetches >= SESSION_INACTIVITY_FETCHES:
+                sessions.append(
+                    _HistorySessionRange(
+                        player_key=player_key,
+                        start_snapshot_id=active_start,
+                        end_snapshot_id=snapshot_id,
+                    )
+                )
+                active_start = None
+                last_present = None
+                unchanged_fetches = 0
+                awaiting_score_change = True
+                closed_score = current_score
+
+        if active_start is not None and last_present is not None:
+            sessions.append(
+                _HistorySessionRange(
+                    player_key=player_key,
+                    start_snapshot_id=active_start,
+                    end_snapshot_id=last_present,
+                )
+            )
+
+    return sessions
 
 
 def _player_state(entry: PlayerEntry) -> _PlayerState:

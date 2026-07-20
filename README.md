@@ -71,11 +71,12 @@ uv run tf-leader --db D:\data\tf.sqlite3 search "Player"
 - API의 `change` 필드는 값이 바뀐 경우에만 좁은 `rank_change_events` 정수 행으로 저장합니다.
 - 순위권에서 빠진 유저는 tombstone으로 기록합니다.
 - `current_entries`에는 검증된 최신 10,000행을 유지하므로 `/leaderboard`와 검색 API는 전체 스냅샷 때와 같은 결과를 제공합니다.
-- 이름 이력 조회 시 상태·멤버십·순서 이벤트를 시간순으로 재생합니다. 변경이 없었던 스냅샷도 복원하므로 20분 단위 순위·점수 그래프 시점이 빠지지 않습니다.
+- 12개 스냅샷마다 검증된 전체 상태 체크포인트를 저장합니다. 세션 이력 조회는 세션 직전 체크포인트부터 필요한 구간만 재생합니다.
+- `/api/users/history`는 마지막 점수 변경 뒤 5회 연속 점수가 같으면 세션을 닫고, 기본적으로 최신 세션만 반환합니다. `session=2`부터 이전 세션을 조회할 수 있습니다.
 - 복원된 매 스냅샷의 10,000행 전체 순서와 모든 필드를 원본 및 SHA-256과 대조합니다. 완전히 일치한 경우에만 하나의 SQLite 트랜잭션으로 커밋합니다.
 - 동일 시각의 서로 다른 데이터와 최신보다 오래된 데이터는 기존 상태를 훼손하지 않도록 거부합니다.
 
-기존 DB는 첫 실행 때 자동 변환됩니다. v1은 `data/leaderboard.sqlite3-pre-delta-v1.bak`, v2는 `data/leaderboard.sqlite3-pre-reconstruction-v2.bak`에 SQLite 온라인 백업을 만든 후 모든 스냅샷을 v3 방식으로 복원·검증합니다. 검증이 끝난 구형 중복 행은 운영 DB에서 제거하고 `VACUUM`으로 압축하지만 원본 백업에는 그대로 남습니다.
+기존 DB는 첫 실행 때 자동 변환됩니다. v1은 `data/leaderboard.sqlite3-pre-delta-v1.bak`, v2는 `data/leaderboard.sqlite3-pre-reconstruction-v2.bak`에 SQLite 온라인 백업을 만든 후 복원·검증합니다. v3 DB는 원본 이벤트를 변경하지 않고 v4 체크포인트를 한 번 생성합니다. 검증이 끝난 v1/v2 구형 중복 행은 운영 DB에서 제거하고 `VACUUM`으로 압축하지만 원본 백업에는 그대로 남습니다.
 
 ## 테스트
 
@@ -97,7 +98,8 @@ uv run python live.py
 
 - `GET /leaderboard`: Clubweb 호환 최신 10,000명 데이터
 - `GET /api/users/search?q=Balise`: 최신 유저 검색
-- `GET /api/users/history?q=Balise%232431`: 점수·순위 이력
+- `GET /api/users/history?q=Balise%232431`: 최신 점수·순위 세션과 전체 세션 수
+- `GET /api/users/history?q=Balise%232431&session=2`: 바로 이전 세션
 - `GET /api/graphs/score.png?q=Balise%232431`: 점수 PNG
 - `GET /api/graphs/rank.png?q=Balise%232431`: 순위 PNG
 - `GET /health`: 수집기, DB, 다음 갱신 상태
@@ -112,4 +114,4 @@ uv run python live.py --season s11 --port 3000 `
 
 서버는 보안을 위해 `127.0.0.1`에만 바인딩됩니다. `Ctrl+C`로 정상 종료할 수 있으며, 로그는 10MB 단위로 회전해 최대 5개 백업을 유지합니다. 스냅샷은 자동 삭제하지 않습니다.
 
-복원 DB의 용량은 실제 점수·프로필·멤버십 변경률과 `change` 필드 변경률에 좌우됩니다. 현재 실제 데이터에서 최신 갱신은 기존 전체 행 증분으로 10,051개 행이 필요했지만, v3는 상태 1,007개, 순서 927개와 좁은 24시간 변동 정수 이벤트로 같은 10,000명을 복원했습니다. 점수가 그대로인 8,775명의 순위 이동은 별도로 저장하지 않았습니다. 조용한 스냅샷은 메타데이터 외 증가가 거의 없으며, 실제 활성 샘플은 약 1.2~2.4MB 증가했습니다. 이런 변동이 20분마다 계속되는 극단적인 경우 약 85~170MB/일까지 증가할 수 있습니다.
+복원 DB의 용량은 실제 점수·프로필·멤버십 변경률과 `change` 필드 변경률에 좌우됩니다. v4는 여기에 12개 스냅샷마다 10,000행 체크포인트 하나를 추가합니다. 점수가 그대로인 유저의 일반 순위 이동은 이벤트로 중복 저장하지 않으며, 조회 시 가장 가까운 체크포인트와 이후 이벤트로 정확한 순위를 복원합니다.

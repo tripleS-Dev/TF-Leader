@@ -101,6 +101,13 @@ class PlayerHistoryPoint:
 
 
 @dataclass(frozen=True, slots=True)
+class PlayerHistorySession:
+    session: int
+    total_sessions: int
+    points: tuple[PlayerHistoryPoint, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SyncResult:
     snapshot_id: int
     season: str

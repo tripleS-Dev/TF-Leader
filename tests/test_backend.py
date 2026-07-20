@@ -195,6 +195,57 @@ def test_delta_store_tracks_rank_only_changes_and_reconstructs_history(
     assert image.startswith(b"\x89PNG\r\n\x1a\n")
 
 
+def test_history_sessions_use_five_unchanged_fetches_and_checkpoints(
+    tmp_path,
+) -> None:
+    store = LeaderboardStore(tmp_path / "leaderboard.sqlite3")
+    first_time = datetime(2026, 7, 16, 8, tzinfo=timezone.utc)
+    scores = [100, 110, *([110] * 11), 120, *([120] * 5)]
+    snapshot_ids: list[int] = []
+    for index, score in enumerate(scores):
+        snapshot_id, _ = store.save_snapshot(
+            _snapshot(
+                first_time + timedelta(minutes=20 * index),
+                _player("Player#1234", 1, score),
+            )
+        )
+        snapshot_ids.append(snapshot_id)
+
+    latest = store.history_session("Player#1234")
+    assert latest.session == 1
+    assert latest.total_sessions == 2
+    assert [point.snapshot_id for point in latest.points] == snapshot_ids[13:19]
+    assert [point.score for point in latest.points] == [120] * 6
+
+    previous = store.history_session("Player#1234", session=2)
+    assert previous.total_sessions == 2
+    assert [point.snapshot_id for point in previous.points] == snapshot_ids[:7]
+    assert [point.score for point in previous.points] == [
+        100,
+        110,
+        110,
+        110,
+        110,
+        110,
+        110,
+    ]
+
+    missing = store.history_session("Player#1234", session=3)
+    assert missing.total_sessions == 2
+    assert missing.points == ()
+
+    with sqlite3.connect(store.db_path) as connection:
+        checkpoints = connection.execute(
+            """
+            SELECT snapshot_id
+            FROM history_checkpoints
+            ORDER BY snapshot_id
+            """
+        ).fetchall()
+    assert checkpoints == [(snapshot_ids[0],), (snapshot_ids[12],)]
+
+
+
 def test_equal_score_reorder_is_saved_as_minimal_correction(tmp_path) -> None:
     store = LeaderboardStore(tmp_path / "leaderboard.sqlite3")
     now = datetime(2026, 7, 16, 8, tzinfo=timezone.utc)
@@ -375,7 +426,7 @@ def test_v1_full_snapshots_migrate_without_deleting_legacy_rows(tmp_path) -> Non
     assert metadata is not None and metadata.integrity_verified is True
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 0
         assert (
             connection.execute("SELECT COUNT(*) FROM current_entries").fetchone()[0]
