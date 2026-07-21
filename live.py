@@ -155,7 +155,7 @@ def create_app(
 
     app = FastAPI(
         title="TF-Leader Live API",
-        version="0.4.0",
+        version="0.4.1",
         description="THE FINALS 리더보드 수집·검색·이력·그래프 localhost API",
         lifespan=lifespan,
     )

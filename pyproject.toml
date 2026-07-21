@@ -1,6 +1,6 @@
 [project]
 name = "tf-leader"
-version = "0.4.0"
+version = "0.4.1"
 description = "THE FINALS leaderboard collection, search, and history charts"
 readme = "README.md"
 requires-python = ">=3.12"

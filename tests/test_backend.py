@@ -195,18 +195,19 @@ def test_delta_store_tracks_rank_only_changes_and_reconstructs_history(
     assert image.startswith(b"\x89PNG\r\n\x1a\n")
 
 
-def test_history_sessions_use_five_unchanged_fetches_and_checkpoints(
+def test_history_sessions_use_score_changes_eight_fetch_gaps_and_context(
     tmp_path,
 ) -> None:
     store = LeaderboardStore(tmp_path / "leaderboard.sqlite3")
     first_time = datetime(2026, 7, 16, 8, tzinfo=timezone.utc)
-    scores = [100, 110, *([110] * 11), 120, *([120] * 5)]
+    scores = [100, 100, 110, *([110] * 8), 120, 120, 120]
     snapshot_ids: list[int] = []
     for index, score in enumerate(scores):
         snapshot_id, _ = store.save_snapshot(
             _snapshot(
                 first_time + timedelta(minutes=20 * index),
                 _player("Player#1234", 1, score),
+                _player("Static#0001", 2, 50),
             )
         )
         snapshot_ids.append(snapshot_id)
@@ -214,21 +215,29 @@ def test_history_sessions_use_five_unchanged_fetches_and_checkpoints(
     latest = store.history_session("Player#1234")
     assert latest.session == 1
     assert latest.total_sessions == 2
-    assert [point.snapshot_id for point in latest.points] == snapshot_ids[13:19]
-    assert [point.score for point in latest.points] == [120] * 6
+    assert [point.snapshot_id for point in latest.points] == snapshot_ids[9:14]
+    assert [point.score for point in latest.points] == [
+        110,
+        110,
+        120,
+        120,
+        120,
+    ]
 
     previous = store.history_session("Player#1234", session=2)
     assert previous.total_sessions == 2
-    assert [point.snapshot_id for point in previous.points] == snapshot_ids[:7]
+    assert [point.snapshot_id for point in previous.points] == snapshot_ids[:5]
     assert [point.score for point in previous.points] == [
+        100,
         100,
         110,
         110,
         110,
-        110,
-        110,
-        110,
     ]
+
+    static = store.history_session("Static#0001")
+    assert static.total_sessions == 0
+    assert static.points == ()
 
     missing = store.history_session("Player#1234", session=3)
     assert missing.total_sessions == 2

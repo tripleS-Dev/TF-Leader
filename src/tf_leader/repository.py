@@ -22,7 +22,8 @@ from .models import (
 
 SCHEMA_VERSION = 4
 HISTORY_CHECKPOINT_INTERVAL = 12
-SESSION_INACTIVITY_FETCHES = 5
+SESSION_INACTIVITY_FETCHES = 8
+SESSION_CONTEXT_FETCHES = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -1576,90 +1577,82 @@ def _history_session_ranges(
 
     for player_key in sorted(target_keys):
         present = False
-        ever_seen = False
-        awaiting_score_change = False
         current_score: int | None = None
-        closed_score: int | None = None
-        active_start: int | None = None
-        last_present: int | None = None
-        unchanged_fetches = 0
+        observations: list[tuple[int, int]] = []
+        segments: list[list[tuple[int, int]]] = []
 
         for snapshot_id in snapshot_ids:
             event = events.get((snapshot_id, player_key))
-            reappeared = False
-            score_changed = False
             if event is not None:
                 if not int(event["is_present"]):
-                    if active_start is not None and last_present is not None:
-                        sessions.append(
-                            _HistorySessionRange(
-                                player_key=player_key,
-                                start_snapshot_id=active_start,
-                                end_snapshot_id=last_present,
-                            )
-                        )
+                    if observations:
+                        segments.append(observations)
+                        observations = []
                     present = False
-                    active_start = None
-                    last_present = None
-                    unchanged_fetches = 0
-                    awaiting_score_change = True
-                    closed_score = current_score
                     current_score = None
                     continue
-
-                new_score = int(event["score"])
-                reappeared = ever_seen and not present
-                score_changed = present and new_score != current_score
                 present = True
-                ever_seen = True
-                current_score = new_score
+                current_score = int(event["score"])
             elif not present:
                 continue
 
-            if active_start is None:
-                should_start = (
-                    not awaiting_score_change
-                    or reappeared
-                    or (
-                        closed_score is not None
-                        and current_score != closed_score
-                    )
-                )
-                if not should_start:
-                    continue
-                active_start = snapshot_id
-                unchanged_fetches = 0
-                awaiting_score_change = False
-            elif score_changed:
-                unchanged_fetches = 0
-            else:
-                unchanged_fetches += 1
+            if current_score is None:
+                continue
+            observations.append((snapshot_id, current_score))
 
-            last_present = snapshot_id
-            if unchanged_fetches >= SESSION_INACTIVITY_FETCHES:
-                sessions.append(
-                    _HistorySessionRange(
-                        player_key=player_key,
-                        start_snapshot_id=active_start,
-                        end_snapshot_id=snapshot_id,
-                    )
-                )
-                active_start = None
-                last_present = None
-                unchanged_fetches = 0
-                awaiting_score_change = True
-                closed_score = current_score
+        if observations:
+            segments.append(observations)
 
-        if active_start is not None and last_present is not None:
+        for segment in segments:
+            change_indices = [
+                index
+                for index in range(1, len(segment))
+                if segment[index][1] != segment[index - 1][1]
+            ]
+            if not change_indices:
+                continue
+
+            first_change = change_indices[0]
+            last_change = change_indices[0]
+            for change_index in change_indices[1:]:
+                unchanged_fetches = change_index - last_change - 1
+                if unchanged_fetches >= SESSION_INACTIVITY_FETCHES:
+                    sessions.append(
+                        _session_range_from_changes(
+                            player_key,
+                            segment,
+                            first_change,
+                            last_change,
+                        )
+                    )
+                    first_change = change_index
+                last_change = change_index
+
             sessions.append(
-                _HistorySessionRange(
-                    player_key=player_key,
-                    start_snapshot_id=active_start,
-                    end_snapshot_id=last_present,
+                _session_range_from_changes(
+                    player_key,
+                    segment,
+                    first_change,
+                    last_change,
                 )
             )
 
     return sessions
+
+
+def _session_range_from_changes(
+    player_key: str,
+    observations: Sequence[tuple[int, int]],
+    first_change: int,
+    last_change: int,
+) -> _HistorySessionRange:
+    start_index = max(0, first_change - SESSION_CONTEXT_FETCHES)
+    end_index = min(len(observations) - 1, last_change + SESSION_CONTEXT_FETCHES)
+    return _HistorySessionRange(
+        player_key=player_key,
+        start_snapshot_id=observations[start_index][0],
+        end_snapshot_id=observations[end_index][0],
+    )
 
 
 def _player_state(entry: PlayerEntry) -> _PlayerState:
