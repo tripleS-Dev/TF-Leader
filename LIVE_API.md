@@ -10,7 +10,7 @@
 | API 버전 | `0.4.1` |
 | 기본 주소 | `http://127.0.0.1:3000` |
 | 기본 시즌 | `s11` |
-| 기본 수집 주기 | 성공 후 1,200초(20분) |
+| 기본 수집 주기 | 성공 후 600초(10분) |
 | 기본 재시도 주기 | 실패 후 120초(2분) |
 | 응답 데이터 형식 | JSON 또는 PNG |
 | 인증 | 없음 |
@@ -37,7 +37,7 @@ http://127.0.0.1:3000
 
 - 로컬 DB에 기존 스냅샷이 있으면 첫 동기화가 끝나기 전에도 기존 데이터를 조회할 수 있습니다.
 - 기존 스냅샷이 없으면 첫 동기화가 끝날 때까지 데이터 API는 주로 `503 Service Unavailable`을 반환합니다.
-- 동기화에 성공하면 기본적으로 20분 뒤 다시 수집합니다.
+- 동기화에 성공하면 기본적으로 10분 뒤 다시 수집합니다.
 - 동기화에 실패하면 기존 DB 데이터는 계속 제공하며 기본적으로 2분 뒤 재시도합니다.
 - 종료할 때는 서버를 실행한 터미널에서 `Ctrl+C`를 누릅니다.
 
@@ -47,7 +47,7 @@ http://127.0.0.1:3000
 uv run python live.py `
   --season s11 `
   --port 3000 `
-  --refresh-seconds 1200 `
+  --refresh-seconds 600 `
   --retry-seconds 120 `
   --db data\leaderboard.sqlite3 `
   --log-file logs\live.log
@@ -57,7 +57,7 @@ uv run python live.py `
 | --- | --- | --- | --- |
 | `--season` | `s11` | 자동 수집 및 `/leaderboard`, `/health`에서 사용할 시즌 | 공백 제거와 소문자 변환 후 `s` + 숫자 형식이어야 함 |
 | `--port` | `3000` | localhost HTTP 포트 | `1`~`65535` |
-| `--refresh-seconds` | `1200` | 수집 성공 후 다음 수집까지 대기할 초 | `0`보다 큰 실수 |
+| `--refresh-seconds` | `600` | 수집 성공 후 다음 수집까지 대기할 초 | `0`보다 큰 실수 |
 | `--retry-seconds` | `120` | 수집 실패 후 재시도까지 대기할 초 | `0`보다 큰 실수 |
 | `--db` | `data/leaderboard.sqlite3` | SQLite DB 경로 | 상대 경로이면 실행 시 절대 경로로 해석됨 |
 | `--log-file` | `logs/live.log` | 로그 파일 경로 | 부모 디렉터리는 자동 생성됨 |
@@ -237,7 +237,7 @@ curl.exe "http://127.0.0.1:3000/leaderboard"
 ```http
 HTTP/1.1 200 OK
 Content-Type: application/json
-Cache-Control: public, max-age=1200
+Cache-Control: public, max-age=600
 Expires: Fri, 17 Jul 2026 02:22:07 GMT
 ```
 
@@ -289,7 +289,7 @@ Expires: Fri, 17 Jul 2026 02:22:07 GMT
 - 스케줄러가 꺼져 있거나 다음 시각이 아직 없으면 현재 시각 + `refresh_seconds`를 사용합니다.
 - 계산 결과가 0 이하더라도 최소 `max-age=1`을 사용합니다.
 
-따라서 `max-age`는 항상 정확히 `1200`인 것이 아니라 요청 시점에 따라 감소할 수 있습니다.
+따라서 `max-age`는 항상 정확히 `600`인 것이 아니라 요청 시점에 따라 감소할 수 있습니다.
 
 ### 5.5 데이터가 없는 응답
 
@@ -1067,7 +1067,7 @@ LiveSettings(
     db_path=PROJECT_ROOT / "data" / "leaderboard.sqlite3",
     season="s11",
     port=3000,
-    refresh_seconds=1200,
+    refresh_seconds=600,
     retry_seconds=120,
     log_path=PROJECT_ROOT / "logs" / "live.log",
     scheduler_enabled=True,

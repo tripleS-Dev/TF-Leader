@@ -86,7 +86,7 @@ uv run pytest
 
 ## 24/7 localhost 서버
 
-`live.py`는 시작 즉시 데이터를 수집하고, 성공 시 20분 뒤 다시 수집합니다. Embark 요청이 실패하면 기존 SQLite 데이터를 계속 제공하면서 2분 뒤 재시도합니다.
+`live.py`는 시작 즉시 데이터를 수집하고, 성공 시 10분 뒤 다시 수집합니다. Embark 요청이 실패하면 기존 SQLite 데이터를 계속 제공하면서 2분 뒤 재시도합니다.
 
 ```powershell
 uv run python live.py
@@ -108,7 +108,7 @@ uv run python live.py
 
 ```powershell
 uv run python live.py --season s11 --port 3000 `
-  --refresh-seconds 1200 --retry-seconds 120 `
+  --refresh-seconds 600 --retry-seconds 120 `
   --db data\leaderboard.sqlite3 --log-file logs\live.log
 ```
 

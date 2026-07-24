@@ -36,7 +36,7 @@ class LiveSettings:
     db_path: Path = PROJECT_ROOT / "data" / "leaderboard.sqlite3"
     season: str = "s11"
     port: int = 3000
-    refresh_seconds: float = 20 * 60
+    refresh_seconds: float = 10 * 60
     retry_seconds: float = 2 * 60
     log_path: Path = PROJECT_ROOT / "logs" / "live.log"
     scheduler_enabled: bool = True
@@ -445,7 +445,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db", type=Path, default=LiveSettings().db_path)
     parser.add_argument("--season", default="s11")
     parser.add_argument("--port", type=int, default=3000)
-    parser.add_argument("--refresh-seconds", type=_positive_float, default=1_200)
+    parser.add_argument(
+        "--refresh-seconds",
+        type=_positive_float,
+        default=LiveSettings().refresh_seconds,
+    )
     parser.add_argument("--retry-seconds", type=_positive_float, default=120)
     parser.add_argument("--log-file", type=Path, default=LiveSettings().log_path)
     return parser.parse_args()

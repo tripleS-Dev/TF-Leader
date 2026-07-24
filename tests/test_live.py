@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
-from live import LiveRuntime, LiveSettings, create_app
+from live import LiveRuntime, LiveSettings, create_app, parse_args
 from tf_leader import LeaderboardSnapshot, PlayerEntry, SyncResult, TFLeaderboard
 
 
@@ -25,6 +25,12 @@ class SequenceLeaderboard:
             entries_saved=1,
             created=True,
         )
+
+
+def test_cli_defaults_to_ten_minute_refresh(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["live.py"])
+
+    assert parse_args().refresh_seconds == 600
 
 
 def _snapshot(updated_at: datetime, *, rank: int, score: int) -> LeaderboardSnapshot:
